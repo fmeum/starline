@@ -33,9 +33,191 @@ func (ev *evaluator) transformFile(f *syntax.File) *syntax.File {
 	for _, stmt := range f.Stmts {
 		newStmts = append(newStmts, ev.transformStmt(stmt)...)
 	}
+	newStmts = pruneUnusedTopLevelConstants(newStmts)
 	return &syntax.File{
 		Path:  f.Path,
 		Stmts: newStmts,
+	}
+}
+
+// pruneUnusedTopLevelConstants removes dead top-level constant assignments after
+// partial evaluation. Top-level expression statements are always preserved.
+func pruneUnusedTopLevelConstants(stmts []syntax.Stmt) []syntax.Stmt {
+	keep := make([]bool, len(stmts))
+	live := make(map[string]struct{})
+
+	// Backward liveness over top-level statements.
+	for i := len(stmts) - 1; i >= 0; i-- {
+		stmt := stmts[i]
+		if name, ok := constantAssignName(stmt); ok {
+			if _, needed := live[name]; !needed {
+				continue
+			}
+		}
+
+		keep[i] = true
+
+		for name := range stmtDefinedNames(stmt) {
+			delete(live, name)
+		}
+		for name := range stmtUsedNames(stmt) {
+			live[name] = struct{}{}
+		}
+	}
+
+	var out []syntax.Stmt
+	for i, stmt := range stmts {
+		if keep[i] {
+			out = append(out, stmt)
+		}
+	}
+	return out
+}
+
+func constantAssignName(stmt syntax.Stmt) (string, bool) {
+	assign, ok := stmt.(*syntax.AssignStmt)
+	if !ok || assign.Op != syntax.EQ {
+		return "", false
+	}
+	lhs, ok := assign.LHS.(*syntax.Ident)
+	if !ok {
+		return "", false
+	}
+	if !isConstantExpr(assign.RHS) {
+		return "", false
+	}
+	return lhs.Name, true
+}
+
+func isConstantExpr(expr syntax.Expr) bool {
+	switch e := expr.(type) {
+	case *syntax.Literal:
+		return true
+	case *syntax.Ident:
+		return e.Name == "True" || e.Name == "False" || e.Name == "None"
+	case *syntax.UnaryExpr:
+		return isConstantExpr(e.X)
+	case *syntax.ListExpr:
+		for _, item := range e.List {
+			if !isConstantExpr(item) {
+				return false
+			}
+		}
+		return true
+	case *syntax.TupleExpr:
+		for _, item := range e.List {
+			if !isConstantExpr(item) {
+				return false
+			}
+		}
+		return true
+	case *syntax.DictExpr:
+		for _, item := range e.List {
+			entry, ok := item.(*syntax.DictEntry)
+			if !ok || !isConstantExpr(entry.Key) || !isConstantExpr(entry.Value) {
+				return false
+			}
+		}
+		return true
+	case *syntax.ParenExpr:
+		return isConstantExpr(e.X)
+	default:
+		return false
+	}
+}
+
+func stmtUsedNames(stmt syntax.Stmt) map[string]struct{} {
+	used := make(map[string]struct{})
+	switch s := stmt.(type) {
+	case *syntax.LoadStmt:
+		// no uses
+	case *syntax.AssignStmt:
+		addExprUses(used, s.RHS)
+		if s.Op != syntax.EQ {
+			addExprUses(used, s.LHS)
+		}
+	case *syntax.ExprStmt:
+		addExprUses(used, s.X)
+	case *syntax.ReturnStmt:
+		addExprUses(used, s.Result)
+	case *syntax.ForStmt:
+		addExprUses(used, s.X)
+		for _, bodyStmt := range s.Body {
+			mergeNameSet(used, stmtUsedNames(bodyStmt))
+		}
+	case *syntax.WhileStmt:
+		addExprUses(used, s.Cond)
+		for _, bodyStmt := range s.Body {
+			mergeNameSet(used, stmtUsedNames(bodyStmt))
+		}
+	case *syntax.IfStmt:
+		addExprUses(used, s.Cond)
+		for _, bodyStmt := range s.True {
+			mergeNameSet(used, stmtUsedNames(bodyStmt))
+		}
+		for _, bodyStmt := range s.False {
+			mergeNameSet(used, stmtUsedNames(bodyStmt))
+		}
+	case *syntax.DefStmt:
+		for _, param := range s.Params {
+			if be, ok := param.(*syntax.BinaryExpr); ok && be.Op == syntax.EQ {
+				addExprUses(used, be.Y)
+			}
+		}
+		for _, bodyStmt := range s.Body {
+			mergeNameSet(used, stmtUsedNames(bodyStmt))
+		}
+	default:
+		// Be conservative for unsupported statements.
+		syntax.Walk(s, func(n syntax.Node) bool {
+			if id, ok := n.(*syntax.Ident); ok {
+				used[id.Name] = struct{}{}
+			}
+			return true
+		})
+	}
+	return used
+}
+
+func stmtDefinedNames(stmt syntax.Stmt) map[string]struct{} {
+	defs := make(map[string]struct{})
+	switch s := stmt.(type) {
+	case *syntax.AssignStmt:
+		collectIdents(s.LHS, defs)
+	case *syntax.LoadStmt:
+		for _, ident := range s.To {
+			defs[ident.Name] = struct{}{}
+		}
+	case *syntax.DefStmt:
+		defs[s.Name.Name] = struct{}{}
+	case *syntax.ForStmt:
+		collectIdents(s.Vars, defs)
+	}
+	return defs
+}
+
+func addExprUses(dst map[string]struct{}, expr syntax.Expr) {
+	if expr == nil {
+		return
+	}
+	freeVars := collectFreeVars(expr, nil)
+	if freeVars.unknown {
+		syntax.Walk(expr, func(n syntax.Node) bool {
+			if id, ok := n.(*syntax.Ident); ok {
+				dst[id.Name] = struct{}{}
+			}
+			return true
+		})
+		return
+	}
+	for name := range freeVars.names {
+		dst[name] = struct{}{}
+	}
+}
+
+func mergeNameSet(dst, src map[string]struct{}) {
+	for name := range src {
+		dst[name] = struct{}{}
 	}
 }
 
